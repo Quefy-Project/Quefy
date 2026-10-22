@@ -3,28 +3,140 @@ info:
   title: Quefy API (core operations and their errors)
   version: "1.0.0"
   description: |
-    A short description of 12 core operations of the Quefy API with the errors each one can return.
+    Quefy is a shared party queue: a host opens a room, guests join with a short code, everybody adds
+    and votes on tracks, and a "speaker" (a bridge app on the host's PC) plays the music.
+    This document describes 12 core operations of the REST API and every error each one can return.
     The running server publishes the full document at `/openapi/v1.json` (UI at `/docs`).
 
-    Every error is a problem document (RFC 9457, `application/problem+json`) with a stable `code`.
-    - 400: the request body or parameters are malformed
-    - 401: missing, expired or invalid token
-    - 403: logged in, but not allowed in this room
-    - 404: the thing does not exist
-    - 409: conflicts with the current state
-    - 422: well-formed, but breaks a business rule
-    - 429: too many requests (always with `Retry-After`)
-    - 502 / 503: an upstream service or the speaker is unavailable
+    ## Authentication
+    There are no passwords. A client registers a device with `POST /api/v1/auth/device` and receives
+    an **access token** (JWT, valid 30 minutes) and a **refresh token** (valid 90 days, single use).
+    Send the access token as `Authorization: Bearer <token>`. When it expires, call
+    `POST /api/v1/auth/refresh`. Operations marked `security: []` need no token.
+    Speakers use a separate JWT (valid 24 hours) from `POST /api/v1/speakers/pair`; it only works for the
+    speaker hub and is rejected (`403 speaker_scope_required`) by user endpoints that need a user token.
+
+    ## Roles in a room
+    | Role | Can do |
+    |------|--------|
+    | Guest | join, search, add own tracks (within the room rules), vote, vote to skip, remove own tracks |
+    | Co-host | everything a guest can, plus change rules, remove any track, control playback, skip the add cooldown and quota |
+    | Host (owner) | everything a co-host can, plus end the party and manage co-hosts |
+
+    ## Errors
+    Every error is a problem document (RFC 9457, `application/problem+json`) with a stable machine
+    `code`. **Clients must branch on `code`, never on `title` or `detail`** — titles are human text and may
+    be reworded. Extra members (for example `limit`, `retryAfterSeconds`, `currentRevision`) are only
+    present for the codes that document them. `traceId` is the id to quote when reporting a problem;
+    it is searchable in the server logs.
+
+    | HTTP | Meaning | Should the client retry? |
+    |------|---------|--------------------------|
+    | 400 | The body or parameters are malformed or fail validation | No, fix the request |
+    | 401 | Missing, expired or invalid token | Refresh the token once, then retry; otherwise sign in again |
+    | 403 | Authenticated, but not allowed to do this in this room | No |
+    | 404 | The thing does not exist (or the caller may not know it exists) | No |
+    | 409 | Conflicts with the current state (duplicate, stale revision, ended party) | Depends on `code`; reload state first |
+    | 422 | Well-formed, but breaks a business rule of the room | No, show the message to the user |
+    | 429 | Too many requests; `Retry-After` header is always present | Yes, after `Retry-After` seconds |
+    | 502 | An upstream service (the music catalog) failed | Yes, with exponential backoff |
+    | 503 | The speaker is offline or a dependency is unavailable | Yes, after a short delay |
+
+    ### Error code catalog
+    | Code | HTTP | When |
+    |------|------|------|
+    | `validation_failed` | 400 | One or more fields are invalid; see `errors` |
+    | `malformed_request` | 400 | The body is not valid JSON or has the wrong shape |
+    | `unauthorized` | 401 | No token, or the token is invalid or expired |
+    | `refresh_token_invalid` | 401 | Refresh token is unknown, expired or revoked |
+    | `refresh_token_reused` | 401 | A refresh token was used twice; the whole session is revoked (theft protection) |
+    | `not_room_member` | 403 | The user has not joined this room |
+    | `host_only` | 403 | Needs the host or a co-host |
+    | `owner_only` | 403 | Needs the room owner |
+    | `banned_from_room` | 403 | The user was removed from this room by the host |
+    | `speaker_scope_required` | 403 | The endpoint needs a speaker token |
+    | `not_your_track` | 403 | A guest tried to remove somebody else's track |
+    | `room_not_found` | 404 | Unknown room id or code |
+    | `queue_item_not_found` | 404 | Unknown queue item in this room |
+    | `track_not_found` | 404 | The catalog does not know this `trackRef` |
+    | `pairing_code_invalid` | 404 | Pairing code is unknown, expired or already used |
+    | `nothing_playing` | 404 | Skip vote while nothing is playing |
+    | `track_already_queued` | 409 | The track is already waiting in the queue |
+    | `track_recently_played` | 409 | The track was played inside the room's repeat window |
+    | `concurrency_conflict` | 409 | Stale `expectedRevision`; someone else saved first |
+    | `room_not_active` | 409 | The party has ended |
+    | `idempotency_key_reused` | 409 | The same `Idempotency-Key` was sent with a different request |
+    | `request_in_progress` | 409 | An identical request with this key is still being processed |
+    | `invalid_state_transition` | 409 | The item can no longer change to that state (for example it is already playing) |
+    | `queue_quota_exceeded` | 422 | The guest has the maximum number of tracks waiting |
+    | `track_too_long` | 422 | The track is longer than the room allows |
+    | `explicit_not_allowed` | 422 | The room blocks explicit tracks |
+    | `guests_cannot_add` | 422 | The host paused guest requests |
+    | `not_votable` | 422 | Only waiting tracks can be voted on |
+    | `cannot_vote_own_track` | 422 | Votes on your own track are not counted |
+    | `room_full` | 422 | The room reached `maxMembers` |
+    | `invalid_setting` | 422 | A room setting is out of range; see `field` |
+    | `invalid_display_name` | 422 | Display name is empty, too long or has control characters |
+    | `vibe_prompt_rejected` | 422 | The vibe description is not understandable music guidance |
+    | `rate_limited` | 429 | A per-IP or per-user rate limit was hit; see `policy` |
+    | `add_cooldown` | 429 | The guest is adding tracks faster than the room's cooldown |
+    | `upstream_unavailable` | 502 | The music catalog (Deezer) did not answer |
+    | `speaker_offline` | 503 | No speaker is connected to the room |
+
+    ## Rate limits
+    Limits are per client IP for anonymous operations and per user otherwise. A rejected request returns
+    `429` with `Retry-After` (seconds) and `policy` naming the limit.
+
+    | Policy | Applies to | Limit |
+    |--------|-----------|-------|
+    | `auth` | `/auth/device`, `/auth/refresh` | 20 per minute per IP |
+    | `join` | `/rooms/by-code/{code}/join` | 30 per minute per IP |
+    | `pair` | `/speakers/pair` | 10 per minute per IP |
+    | `search` | `/catalog/search` | 90 per minute per user (sliding window) |
+
+    ## Idempotency
+    `POST /rooms/{roomId}/queue` accepts an `Idempotency-Key` header (1–64 visible ASCII characters).
+    The first response is stored for 24 hours per user and key, and replayed byte-for-byte on a retry
+    with the same request. The same key with a different body is `409 idempotency_key_reused`.
+
+    ## Conventions
+    - All ids are UUIDs; all timestamps are ISO 8601 in UTC.
+    - JSON property names are camelCase.
+    - `trackRef` is `<provider>:<id>`, for example `deezer:3135556`.
+    - Real-time updates (queue changes, now playing, votes) are pushed over SignalR (`/hubs/room`);
+      REST responses are the source of truth for the caller's own action.
 servers:
   - url: http://localhost:5080
+    description: Local development server
 security:
   - bearer: []
+
+tags:
+  - name: Identity
+    description: Anonymous device accounts and token refresh. No passwords, no e-mail.
+  - name: Rooms
+    description: Creating a party, joining it with a code, and changing its rules.
+  - name: Catalog
+    description: Searching the music catalog (Deezer). Results are cached for 15 minutes.
+  - name: Queue
+    description: Adding, removing and voting on tracks that wait to be played.
+  - name: Playback
+    description: Skip voting by guests and transport commands sent by the host to the speaker.
+  - name: Speakers
+    description: Pairing the bridge app that actually plays the music.
 
 paths:
   /api/v1/auth/device:
     post:
+      operationId: registerDevice
       tags: [Identity]
       summary: Register a device and get tokens
+      description: |
+        Creates an anonymous account for this device and returns a fresh token pair. Call it once on first
+        launch and store both tokens securely; calling it again creates a **new, different** account.
+
+        Name rules: 1–32 visible characters after trimming; control characters are rejected.
+        `locale` is optional (BCP 47, for example `uk-UA`) and only affects server-generated texts.
       security: []
       requestBody:
         required: true
@@ -34,13 +146,15 @@ paths:
             example: { displayName: Olya, locale: uk-UA }
       responses:
         '201':
-          description: Account created
+          description: Account created. Both tokens are returned; the refresh token is shown only here and on refresh.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AuthResponse' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '422':
-          description: Name is empty or has control characters
+          description: |
+            `invalid_display_name` — the name is empty after trimming, longer than 32 characters or contains
+            control characters. `field` is `displayName`.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -49,8 +163,18 @@ paths:
 
   /api/v1/auth/refresh:
     post:
+      operationId: refreshTokens
       tags: [Identity]
       summary: Exchange a refresh token for a new pair
+      description: |
+        Rotates the session: the old refresh token is consumed and a new access + refresh pair is returned.
+        Refresh tokens are **single use**. If a token that was already used is presented again, the server
+        assumes it was stolen, revokes the whole session (all tokens of this device family) and answers
+        `401 refresh_token_reused`. The client must then register the device again.
+
+        Handle concurrency on the client: if several requests get `401` at the same time, send **one**
+        refresh call and let the others wait for its result — parallel refreshes with the same token
+        will trigger the reuse protection.
       security: []
       requestBody:
         required: true
@@ -59,7 +183,8 @@ paths:
             schema:
               type: object
               required: [refreshToken]
-              properties: { refreshToken: { type: string } }
+              properties:
+                refreshToken: { type: string, description: The refresh token from the last `AuthResponse` }
       responses:
         '200':
           description: New tokens. The old refresh token no longer works.
@@ -68,18 +193,30 @@ paths:
               schema: { $ref: '#/components/schemas/AuthResponse' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401':
-          description: Unknown, expired, revoked or already used refresh token
+          description: |
+            The refresh token cannot be used. `refresh_token_invalid` — unknown, expired (90 days) or revoked.
+            `refresh_token_reused` — it was already exchanged; the session is revoked. In both cases the
+            client has to call `POST /auth/device` again and the user loses their old identity (and any rooms they own).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
               examples:
+                invalid: { value: { type: 'https://quefy.app/problems/refresh_token_invalid', title: The refresh token is invalid or expired., status: 401, code: refresh_token_invalid, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
                 reused: { value: { type: 'https://quefy.app/problems/refresh_token_reused', title: The refresh token was already used; the session has been revoked., status: 401, code: refresh_token_reused, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
         '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/rooms:
     post:
+      operationId: createRoom
       tags: [Rooms]
       summary: Host a party
+      description: |
+        Creates a room and makes the caller its owner (host). The response contains the 6-character join
+        `code` to share with guests. A new room starts with the default rules (see `RoomSettings`).
+
+        The optional vibe describes the music the room wants: pick a built-in `vibePreset`, or write free
+        text in `vibePrompt`. The text is checked by an AI model, so creating a room with a prompt may take
+        a few seconds.
       requestBody:
         required: true
         content:
@@ -88,19 +225,22 @@ paths:
               type: object
               required: [name]
               properties:
-                name: { type: string, minLength: 1, maxLength: 48 }
-                vibePreset: { type: string, examples: [chill] }
-                vibePrompt: { type: string, maxLength: 280 }
+                name: { type: string, minLength: 1, maxLength: 48, description: Public name shown to guests }
+                vibePreset: { type: string, examples: [chill], description: Name of a built-in vibe }
+                vibePrompt: { type: string, maxLength: 280, description: Free-text description of the wanted music, for example "sunset rooftop, mellow house, no screaming" }
+            example: { name: Friday at Olya's, vibePrompt: Mellow indie for a rooftop evening }
       responses:
         '201':
-          description: Party created
+          description: Party created. The caller is the owner.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Room' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '422':
-          description: Invalid name, or a vibe description that is not about music
+          description: |
+            `vibe_prompt_rejected` — `vibePrompt` is not a usable description of music (for example it is off-topic
+            or tries to give the AI instructions). The client should ask the user to rephrase.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -109,32 +249,44 @@ paths:
 
   /api/v1/rooms/by-code/{code}/join:
     post:
+      operationId: joinRoomByCode
       tags: [Rooms]
       summary: Join a party by its code
+      description: |
+        Adds the caller as a guest. Joining is **idempotent**: if the caller is already a member, the room is
+        returned again with `200` and nothing changes. The code is case-insensitive.
+
+        Checks run in this order: the code exists → the room is active → the caller is not banned → the room
+        is not full. A banned user is told so explicitly (`banned_from_room`), they cannot get in with a new
+        code for the same room.
       parameters:
-        - { name: code, in: path, required: true, schema: { type: string, examples: [K7P2QX] } }
+        - name: code
+          in: path
+          required: true
+          description: The 6-character join code shown on the host's screen
+          schema: { type: string, examples: [K7P2QX] }
       responses:
         '200':
-          description: Joined
+          description: Joined (or already a member)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Room' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: The user was banned from this party
+          description: The user was removed from this party by the host (`banned_from_room`).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
               example: { type: 'https://quefy.app/problems/banned_from_room', title: You were removed from this room., status: 403, code: banned_from_room, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
         '404':
-          description: No active party with this code
+          description: No room has this code (`room_not_found`). Codes of ended rooms may also return this once they are cleaned up.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
               example: { type: 'https://quefy.app/problems/room_not_found', title: Room not found., status: 404, code: room_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
         '409': { $ref: '#/components/responses/RoomEnded' }
         '422':
-          description: The party is full
+          description: The party reached its member limit (`room_full`). `limit` is the room's `maxMembers`.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -143,8 +295,17 @@ paths:
 
   /api/v1/rooms/{roomId}:
     patch:
+      operationId: updateRoom
       tags: [Rooms]
       summary: Change the party name or rules (host and co-host)
+      description: |
+        Partial update with **optimistic concurrency**. Send the `settingsRevision` you last saw as
+        `expectedRevision`; the change is applied only if nobody saved in between, and the response carries
+        the new revision. On `409 concurrency_conflict` the response includes `currentRevision` — reload the
+        room, re-apply the user's change on top of the fresh state, and try again.
+
+        Only the properties you send are changed. Every setting is validated against its range, and
+        the whole request is rejected if any one is invalid (nothing is half-applied).
       parameters:
         - { $ref: '#/components/parameters/RoomId' }
       requestBody:
@@ -155,13 +316,13 @@ paths:
               type: object
               required: [expectedRevision]
               properties:
-                expectedRevision: { type: integer, description: The revision the editor saw }
-                name: { type: string }
-                settings: { type: object, additionalProperties: true }
+                expectedRevision: { type: integer, description: The `settingsRevision` the editor saw }
+                name: { type: string, minLength: 1, maxLength: 48 }
+                settings: { $ref: '#/components/schemas/RoomSettings' }
             example: { expectedRevision: 3, settings: { skipRatio: 0.6 } }
       responses:
         '200':
-          description: Updated
+          description: Updated. `settingsRevision` is increased by one and all members are notified in real time.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Room' }
@@ -170,27 +331,44 @@ paths:
         '403': { $ref: '#/components/responses/HostOnly' }
         '404': { $ref: '#/components/responses/RoomNotFound' }
         '409':
-          description: Somebody else changed the rules first, or the party has ended
+          description: |
+            `concurrency_conflict` — somebody changed the rules after the revision you saw (`currentRevision`
+            tells you the latest). `room_not_active` — the party has ended and can no longer be edited.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-              example: { type: 'https://quefy.app/problems/concurrency_conflict', title: The resource was changed by someone else. Reload and try again., status: 409, code: concurrency_conflict, currentRevision: 4, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+              examples:
+                concurrency_conflict: { value: { type: 'https://quefy.app/problems/concurrency_conflict', title: The resource was changed by someone else. Reload and try again., status: 409, code: concurrency_conflict, currentRevision: 4, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                room_not_active: { value: { type: 'https://quefy.app/problems/room_not_active', title: This party has ended., status: 409, code: room_not_active, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
         '422':
-          description: A setting is out of range
+          description: A setting is out of its allowed range (`invalid_setting`). `field` names the first invalid setting and `detail` gives the range.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-              example: { type: 'https://quefy.app/problems/invalid_setting', title: A room setting is out of range., status: 422, code: invalid_setting, field: skipRatio, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+              example: { type: 'https://quefy.app/problems/invalid_setting', title: A room setting is out of range., status: 422, code: invalid_setting, detail: skipRatio must be 0.3-0.9., field: skipRatio, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
 
   /api/v1/catalog/search:
     get:
+      operationId: searchTracks
       tags: [Catalog]
       summary: Search tracks
+      description: |
+        Full-text search over the music catalog (Deezer). Returns up to a page of the best matches, each with a
+        `trackRef` to pass to the queue. Results are cached for 15 minutes, so identical searches are fast and
+        do not count against the upstream. This operation does not depend on a room, any signed-in user may call it.
+
+        If the catalog is down the server answers `502`; it does **not** return an empty list, so the client
+        can tell "no results" from "search broken".
       parameters:
-        - { name: q, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 100 } }
+        - name: q
+          in: query
+          required: true
+          description: The search text, 1–100 characters after trimming
+          schema: { type: string, minLength: 1, maxLength: 100 }
+          example: daft punk around the world
       responses:
         '200':
-          description: Matching tracks
+          description: Matching tracks, best first. An empty array means nothing matched.
           content:
             application/json:
               schema: { type: array, items: { $ref: '#/components/schemas/Track' } }
@@ -198,7 +376,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '502':
-          description: Deezer did not answer
+          description: The catalog provider did not answer in time or returned an error (`upstream_unavailable`). Retry with backoff.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -206,12 +384,34 @@ paths:
 
   /api/v1/rooms/{roomId}/queue:
     post:
+      operationId: addToQueue
       tags: [Queue]
       summary: Add a track to the queue
-      description: Send an `Idempotency-Key` so a retry after a lost response does not add the track twice.
+      description: |
+        Requests a track. The server checks the room rules in this order and returns the first violation:
+
+        1. the caller is a member (`not_room_member`) and the room is active (`room_not_active`)
+        2. the host has not paused requests (`guests_cannot_add`)
+        3. the track exists in the catalog (`track_not_found`)
+        4. explicit tracks are allowed (`explicit_not_allowed`)
+        5. the track is not longer than `maxTrackMinutes` (`track_too_long`)
+        6. the track is not already waiting (`track_already_queued`)
+        7. it was not played within `recentRepeatMinutes` (`track_recently_played`)
+        8. the guest has fewer than `maxPendingPerGuest` waiting tracks (`queue_quota_exceeded`)
+        9. the add cooldown has passed (`add_cooldown`)
+
+        Hosts and co-hosts skip steps 2, 7, 8 and 9. A track that does not match the room's vibe is still
+        accepted when `vibePolicy` is `warn` (it gets a badge) or goes to a host approval list when it is `approve`.
+
+        Send an `Idempotency-Key` so that a retry after a lost response (bad mobile network) does not add the
+        track twice; the original response is replayed for 24 hours.
       parameters:
         - { $ref: '#/components/parameters/RoomId' }
-        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 64 } }
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: A unique value (for example a UUID) generated once per user action and reused on retries. 1–64 visible ASCII characters.
+          schema: { type: string, minLength: 1, maxLength: 64 }
       requestBody:
         required: true
         content:
@@ -219,37 +419,62 @@ paths:
             schema:
               type: object
               required: [trackRef]
-              properties: { trackRef: { type: string, examples: ['deezer:3135556'] } }
+              properties:
+                trackRef: { type: string, examples: ['deezer:3135556'], description: A `trackRef` from the catalog search }
       responses:
         '201':
-          description: Added
+          description: Added. All members get the new queue in real time.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/QueueItem' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/NotMember' }
-        '404': { $ref: '#/components/responses/RoomNotFound' }
+        '404':
+          description: Unknown room (`room_not_found`), or the catalog does not know the track (`track_not_found`).
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                room_not_found: { value: { type: 'https://quefy.app/problems/room_not_found', title: Room not found., status: 404, code: room_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                track_not_found: { value: { type: 'https://quefy.app/problems/track_not_found', title: Track not found., status: 404, code: track_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
         '409':
-          description: Already in the queue, played recently, party ended, or the idempotency key was reused
+          description: |
+            The request conflicts with the current state.
+            `track_already_queued` — the same track is waiting; `queueItemId` points to it so the UI can highlight it or offer to vote.
+            `track_recently_played` — played within `recentRepeatMinutes`; `availableAt` is when it can be added again.
+            `room_not_active` — the party has ended.
+            `idempotency_key_reused` — the key was used before with a different request.
+            `request_in_progress` — an identical request with this key is still running; wait and retry.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
               examples:
                 track_already_queued: { value: { type: 'https://quefy.app/problems/track_already_queued', title: This track is already in the queue., status: 409, code: track_already_queued, queueItemId: 0192a6f4-3c1e-7b2a-9d41-5e8f2c7a1b30, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
                 track_recently_played: { value: { type: 'https://quefy.app/problems/track_recently_played', title: This track was played recently., status: 409, code: track_recently_played, availableAt: '2026-10-21T23:41:00Z', traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                room_not_active: { value: { type: 'https://quefy.app/problems/room_not_active', title: This party has ended., status: 409, code: room_not_active, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                idempotency_key_reused: { value: { type: 'https://quefy.app/problems/idempotency_key_reused', title: This Idempotency-Key was already used for a different request., status: 409, code: idempotency_key_reused, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
         '422':
-          description: A room rule is broken (quota, length, explicit, requests paused)
+          description: |
+            A rule of the room is broken. The request is valid, but the room does not allow it right now.
+            `queue_quota_exceeded` — the guest already has `limit` tracks waiting.
+            `track_too_long` — longer than `maxMinutes`.
+            `explicit_not_allowed` — the room blocks explicit tracks.
+            `guests_cannot_add` — the host paused requests; only hosts can add.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
               examples:
                 queue_quota_exceeded: { value: { type: 'https://quefy.app/problems/queue_quota_exceeded', title: You already have the maximum number of tracks waiting., status: 422, code: queue_quota_exceeded, limit: 3, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
                 track_too_long: { value: { type: 'https://quefy.app/problems/track_too_long', title: This track is longer than the room allows., status: 422, code: track_too_long, maxMinutes: 10, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                explicit_not_allowed: { value: { type: 'https://quefy.app/problems/explicit_not_allowed', title: Explicit tracks are not allowed in this room., status: 422, code: explicit_not_allowed, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                guests_cannot_add: { value: { type: 'https://quefy.app/problems/guests_cannot_add', title: The host has paused requests., status: 422, code: guests_cannot_add, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
         '429':
-          description: Adding too fast (cooldown) or a rate limit
+          description: |
+            `add_cooldown` — the guest adds tracks faster than the room allows (a burst of two is permitted,
+            then one add per `addCooldownSeconds`); wait `retryAfterSeconds`. `rate_limited` — a general limit was hit.
           headers:
-            Retry-After: { schema: { type: integer } }
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -257,28 +482,39 @@ paths:
 
   /api/v1/rooms/{roomId}/queue/{itemId}:
     delete:
+      operationId: removeFromQueue
       tags: [Queue]
       summary: Remove a waiting track (own track, or any track for host and co-host)
+      description: |
+        Removes a track that is still waiting. Guests can remove only tracks they added; the host and co-hosts
+        can remove any track. A track that is already playing cannot be removed — use skip instead.
+        Removing the same item twice returns `404` the second time, which clients may treat as success.
       parameters:
         - { $ref: '#/components/parameters/RoomId' }
         - { $ref: '#/components/parameters/ItemId' }
       responses:
-        '204': { description: Removed }
+        '204': { description: Removed. All members get the new queue in real time. }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: A guest tried to remove somebody else's track
+          description: |
+            `not_your_track` — a guest tried to remove somebody else's track.
+            `not_room_member` — the caller has not joined this room.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-              example: { type: 'https://quefy.app/problems/not_your_track', title: You can only remove tracks you added., status: 403, code: not_your_track, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+              examples:
+                not_your_track: { value: { type: 'https://quefy.app/problems/not_your_track', title: You can only remove tracks you added., status: 403, code: not_your_track, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                not_room_member: { value: { type: 'https://quefy.app/problems/not_room_member', title: You are not a member of this room., status: 403, code: not_room_member, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
         '404':
-          description: No such item in this party
+          description: No such item in this party (`queue_item_not_found`) — wrong id, already removed, or it belongs to another room.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
               example: { type: 'https://quefy.app/problems/queue_item_not_found', title: Queue item not found., status: 404, code: queue_item_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
         '409':
-          description: The item is already playing or was changed at the same time
+          description: |
+            `invalid_state_transition` — the item started playing (or was removed by someone else) at the same
+            moment. Reload the queue and decide again.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -286,8 +522,14 @@ paths:
 
   /api/v1/rooms/{roomId}/queue/{itemId}/vote:
     put:
+      operationId: voteOnQueueItem
       tags: [Queue]
       summary: Vote on a waiting track (+1, -1 or 0 to clear)
+      description: |
+        Sets the caller's vote on a waiting track. The call is **idempotent**: `PUT` replaces the previous
+        vote, so sending the same value twice has no extra effect, and `0` removes the vote. Votes change the
+        order of the queue (fair-play ranking combines votes with how much airtime each guest has already had),
+        so the order can change right after this call; the new order is pushed in real time.
       parameters:
         - { $ref: '#/components/parameters/RoomId' }
         - { $ref: '#/components/parameters/ItemId' }
@@ -298,63 +540,99 @@ paths:
             schema:
               type: object
               required: [value]
-              properties: { value: { type: integer, enum: [-1, 0, 1] } }
+              properties:
+                value: { type: integer, enum: [-1, 0, 1], description: "+1 upvote, -1 downvote, 0 clear the vote" }
+            example: { value: 1 }
       responses:
         '200': { description: Vote saved }
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/NotMember' }
-        '404': { $ref: '#/components/responses/RoomNotFound' }
-        '422':
-          description: Own track, or the track is no longer waiting
+        '404':
+          description: Unknown room (`room_not_found`) or unknown item (`queue_item_not_found`).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-              example: { type: 'https://quefy.app/problems/cannot_vote_own_track', title: You can't vote for your own track., status: 422, code: cannot_vote_own_track, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+              examples:
+                room_not_found: { value: { type: 'https://quefy.app/problems/room_not_found', title: Room not found., status: 404, code: room_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                queue_item_not_found: { value: { type: 'https://quefy.app/problems/queue_item_not_found', title: Queue item not found., status: 404, code: queue_item_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+        '422':
+          description: |
+            `cannot_vote_own_track` — you cannot vote on a track you added.
+            `not_votable` — the track is playing, was played or removed; only waiting tracks accept votes.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                cannot_vote_own_track: { value: { type: 'https://quefy.app/problems/cannot_vote_own_track', title: You can't vote for your own track., status: 422, code: cannot_vote_own_track, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                not_votable: { value: { type: 'https://quefy.app/problems/not_votable', title: Only waiting tracks can be voted on., status: 422, code: not_votable, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
 
   /api/v1/rooms/{roomId}/playback/skip-vote:
     post:
+      operationId: voteToSkip
       tags: [Playback]
       summary: Vote to skip the current track
+      description: |
+        Adds the caller's vote to skip the track that is playing. When `votes` reaches `threshold`
+        the server skips the track and starts the next one. The threshold is
+        derived from `activeListeners` (members seen in the last 10 minutes) and the room's `skipRatio`
+        setting (default 0.5, a strict majority). The call is idempotent per
+        user and track: voting twice counts once. Votes reset when the track changes.
       parameters:
         - { $ref: '#/components/parameters/RoomId' }
       responses:
         '200':
-          description: Current skip status
+          description: Current skip status. If this vote reached the threshold, the track is already being skipped.
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  votes: { type: integer }
-                  threshold: { type: integer }
-                  activeListeners: { type: integer }
+                  votes: { type: integer, description: Skip votes for the current track so far }
+                  threshold: { type: integer, description: Votes needed to skip }
+                  activeListeners: { type: integer, description: Members counted as present right now }
+              example: { votes: 2, threshold: 3, activeListeners: 5 }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/NotMember' }
         '404':
-          description: No such party, or nothing is playing
+          description: Unknown room (`room_not_found`), or nothing is playing right now (`nothing_playing`).
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
-              example: { type: 'https://quefy.app/problems/nothing_playing', title: Nothing is playing right now., status: 404, code: nothing_playing, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+              examples:
+                nothing_playing: { value: { type: 'https://quefy.app/problems/nothing_playing', title: Nothing is playing right now., status: 404, code: nothing_playing, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                room_not_found: { value: { type: 'https://quefy.app/problems/room_not_found', title: Room not found., status: 404, code: room_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
         '409': { $ref: '#/components/responses/RoomEnded' }
         '429': { $ref: '#/components/responses/RateLimited' }
 
   /api/v1/rooms/{roomId}/playback/{command}:
     post:
+      operationId: sendPlaybackCommand
       tags: [Playback]
       summary: Host transport command (play, pause, skip)
+      description: |
+        Sends a command to the room's speaker. Only the host and co-hosts may call it; guests use
+        `skip-vote`. The call is **asynchronous**: `202` means the command was delivered to the speaker, not
+        that it has been executed. The result appears as a real-time "now playing" update. Commands are safe
+        to repeat (`play` while playing does nothing).
+
+        If no speaker is connected the server fails fast with `503 speaker_offline` instead of queuing the
+        command, so a stale `skip` cannot fire minutes later when the speaker returns.
       parameters:
         - { $ref: '#/components/parameters/RoomId' }
-        - { name: command, in: path, required: true, schema: { type: string, enum: [play, pause, skip] } }
+        - name: command
+          in: path
+          required: true
+          description: What the speaker should do
+          schema: { type: string, enum: [play, pause, skip] }
       responses:
-        '202': { description: Command accepted }
+        '202': { description: Command accepted and delivered to the speaker }
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/HostOnly' }
         '404': { $ref: '#/components/responses/RoomNotFound' }
         '503':
-          description: No speaker is connected
+          description: No speaker is connected to this room (`speaker_offline`). Ask the user to open the bridge app and retry.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -362,8 +640,16 @@ paths:
 
   /api/v1/speakers/pair:
     post:
+      operationId: pairSpeaker
       tags: [Speakers]
       summary: Pair a speaker (bridge) with a pairing code
+      description: |
+        Called by the bridge app, not by a phone. The host creates a pairing code in the mobile app;
+        it is valid for **5 minutes** and works **once**. The bridge exchanges it here for a speaker token
+        and then connects to the speaker hub at `hubPath` with that token.
+
+        The endpoint needs no user token, which is why it has its own strict rate limit (10 per minute per IP)
+        against guessing codes.
       security: []
       requestBody:
         required: true
@@ -372,18 +658,24 @@ paths:
             schema:
               type: object
               required: [code]
-              properties: { code: { type: string, examples: [K7P2QX] }, name: { type: string, examples: [Living-room PC] } }
+              properties:
+                code: { type: string, examples: [K7P2QX], description: The pairing code shown in the mobile app }
+                name: { type: string, examples: [Living-room PC], description: A friendly name of this speaker, shown to the host }
       responses:
         '200':
-          description: Speaker token for the speaker hub
+          description: Speaker paired. Keep `accessToken` private; it is valid for 24 hours and the bridge pairs again after that.
           content:
             application/json:
               schema:
                 type: object
-                properties: { speakerId: { type: string, format: uuid }, roomId: { type: string, format: uuid }, accessToken: { type: string, description: Speaker JWT valid 24 hours }, hubPath: { type: string, examples: [/hubs/speaker] } }
+                properties:
+                  speakerId: { type: string, format: uuid }
+                  roomId: { type: string, format: uuid, description: The room this speaker plays for }
+                  accessToken: { type: string, description: Speaker JWT valid 24 hours }
+                  hubPath: { type: string, examples: [/hubs/speaker], description: Path of the SignalR hub to connect to }
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '404':
-          description: Unknown, expired or already used code
+          description: The code is unknown, expired (5 minutes) or was already used (`pairing_code_invalid`). The three cases are not distinguished on purpose. Generate a new code.
           content:
             application/problem+json:
               schema: { $ref: '#/components/schemas/Problem' }
@@ -392,53 +684,84 @@ paths:
 
 components:
   securitySchemes:
-    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: User access token from `/auth/device` or `/auth/refresh`. Valid for 30 minutes.
+
+  headers:
+    RetryAfter:
+      description: How many seconds to wait before the next attempt
+      schema: { type: integer, minimum: 0 }
 
   parameters:
-    RoomId: { name: roomId, in: path, required: true, schema: { type: string, format: uuid } }
-    ItemId: { name: itemId, in: path, required: true, schema: { type: string, format: uuid } }
+    RoomId:
+      name: roomId
+      in: path
+      required: true
+      description: Id of the room (`Room.id`)
+      schema: { type: string, format: uuid }
+    ItemId:
+      name: itemId
+      in: path
+      required: true
+      description: Id of the queue item (`QueueItem.id`), not the track id
+      schema: { type: string, format: uuid }
 
   responses:
     ValidationFailed:
-      description: Invalid fields
+      description: |
+        `validation_failed` — one or more fields are invalid (missing, wrong type, out of length).
+        `errors` maps each field name to a list of messages. `malformed_request` is used when the body is not
+        valid JSON at all.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
           example: { type: 'https://quefy.app/problems/validation_failed', title: One or more fields are invalid., status: 400, code: validation_failed, errors: { trackRef: ['Must look like deezer:123'] }, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
     Unauthorized:
-      description: Missing or expired access token
+      description: |
+        `unauthorized` — the `Authorization` header is missing, malformed, or the access token is invalid or
+        expired. Refresh the token once and repeat the request; if the refresh also fails, sign in again.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
           example: { type: 'https://quefy.app/problems/unauthorized', title: Authentication is required., status: 401, code: unauthorized, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
     NotMember:
-      description: The user is not a member of this party (or was banned)
+      description: |
+        `not_room_member` — the user has not joined this party (or was removed from it). Call the join
+        operation first.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
           example: { type: 'https://quefy.app/problems/not_room_member', title: You are not a member of this room., status: 403, code: not_room_member, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
     HostOnly:
-      description: Only the host or a co-host can do this
+      description: |
+        `host_only` — the caller is a member, but not the host or a co-host. Hide or disable the control in the
+        UI for guests; this error is the server-side guarantee.
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
           example: { type: 'https://quefy.app/problems/host_only', title: Only the host or a co-host can do this., status: 403, code: host_only, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
     RoomNotFound:
-      description: No such party
+      description: '`room_not_found` — no room has this id.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
           example: { type: 'https://quefy.app/problems/room_not_found', title: Room not found., status: 404, code: room_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
     RoomEnded:
-      description: The party has ended
+      description: '`room_not_active` — the host ended the party. It is read-only now; the client should leave the room screen.'
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
           example: { type: 'https://quefy.app/problems/room_not_active', title: This party has ended., status: 409, code: room_not_active, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
     RateLimited:
-      description: Too many requests
+      description: |
+        `rate_limited` — too many requests from this IP or user. `policy` names the limit that was hit
+        (`auth`, `join`, `pair`, `search`) and `retryAfterSeconds` (also the `Retry-After` header) says when
+        to try again. Do not retry sooner.
       headers:
-        Retry-After: { schema: { type: integer } }
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Problem' }
@@ -447,53 +770,69 @@ components:
   schemas:
     Problem:
       type: object
+      description: An error in the RFC 9457 "problem details" format. Only `code` is a stable contract for clients.
       required: [type, title, status, code, traceId]
       properties:
-        type: { type: string, format: uri }
-        title: { type: string }
-        status: { type: integer }
-        detail: { type: string }
-        code: { type: string, description: Stable machine code; clients translate by it }
-        traceId: { type: string }
-        errors: { type: object, additionalProperties: { type: array, items: { type: string } } }
-        queueItemId: { type: string, format: uuid }
-        availableAt: { type: string, format: date-time }
-        limit: { type: integer }
-        maxMinutes: { type: integer }
-        retryAfterSeconds: { type: integer }
-        policy: { type: string }
-        currentRevision: { type: integer }
-        field: { type: string }
+        type: { type: string, format: uri, description: "A URI that identifies the problem type; always `https://quefy.app/problems/<code>`" }
+        title: { type: string, description: Short human-readable summary. Do not parse it; it can be reworded }
+        status: { type: integer, description: The HTTP status code, repeated for convenience }
+        detail: { type: string, description: Optional explanation of this particular occurrence }
+        code: { type: string, description: Stable machine code; clients translate by it. See the error code catalog in the API description }
+        traceId: { type: string, description: Correlation id (W3C trace id). Quote it when reporting a problem }
+        errors: { type: object, additionalProperties: { type: array, items: { type: string } }, description: "`validation_failed` only. Field name → list of messages" }
+        queueItemId: { type: string, format: uuid, description: "`track_already_queued` only. The existing queue item" }
+        availableAt: { type: string, format: date-time, description: "`track_recently_played` only. When the track may be added again" }
+        limit: { type: integer, description: "`queue_quota_exceeded` and `room_full`. The limit that was reached" }
+        maxMinutes: { type: integer, description: "`track_too_long` only. Longest allowed track in minutes" }
+        retryAfterSeconds: { type: integer, description: "429 responses. Seconds to wait; equals the `Retry-After` header" }
+        policy: { type: string, enum: [auth, join, pair, search, ai], description: "`rate_limited` only. Which rate limit was hit" }
+        currentRevision: { type: integer, description: "`concurrency_conflict` only. The latest `settingsRevision`" }
+        field: { type: string, description: "`invalid_setting` and `invalid_display_name`. The offending field" }
     DeviceRequest:
       type: object
       required: [displayName]
       properties:
-        displayName: { type: string, minLength: 1, maxLength: 32 }
-        locale: { type: string }
+        displayName: { type: string, minLength: 1, maxLength: 32, description: Public name other guests see }
+        locale: { type: string, examples: [uk-UA], description: Optional BCP 47 language tag }
     AuthResponse:
       type: object
       properties:
-        accessToken: { type: string }
-        accessTokenExpiresAt: { type: string, format: date-time }
-        refreshToken: { type: string }
-        refreshTokenExpiresAt: { type: string, format: date-time }
+        accessToken: { type: string, description: JWT for the `Authorization` header }
+        accessTokenExpiresAt: { type: string, format: date-time, description: 30 minutes after issue }
+        refreshToken: { type: string, description: Single-use token to get the next pair }
+        refreshTokenExpiresAt: { type: string, format: date-time, description: 90 days after issue }
+    RoomSettings:
+      type: object
+      description: Per-room rules. All properties are optional in a `PATCH`; the defaults apply to a new room.
+      properties:
+        maxPendingPerGuest: { type: integer, minimum: 1, maximum: 20, default: 3, description: Tracks a guest may have waiting at once. Hosts are exempt }
+        addCooldownSeconds: { type: integer, minimum: 0, maximum: 600, default: 20, description: Seconds to refill one add token. A guest can burst two adds }
+        skipRatio: { type: number, minimum: 0.3, maximum: 0.9, default: 0.5, description: Share of active listeners whose skip votes skip the track }
+        allowExplicit: { type: boolean, default: true, description: When false explicit tracks are rejected }
+        maxTrackMinutes: { type: integer, minimum: 3, maximum: 30, default: 10, description: Longest track a guest may add }
+        recentRepeatMinutes: { type: integer, minimum: 0, maximum: 720, default: 60, description: A track cannot be re-added this soon after being played. 0 disables the rule }
+        vibePolicy: { type: string, default: warn, description: "How strictly the vibe is enforced: `off`, `warn` (badge and small ranking penalty) or `approve` (host approval needed)" }
+        autoFill: { type: boolean, default: true, description: Let the AI DJ fill the queue when it runs dry }
+        guestsCanAdd: { type: boolean, default: true, description: When false only hosts can add tracks }
+        maxMembers: { type: integer, minimum: 2, maximum: 500, default: 150, description: Join limit }
+        aiBudget: { type: integer, minimum: 0, maximum: 5000, default: 400, description: Maximum AI model calls for the life of the room }
     Room:
       type: object
       properties:
         id: { type: string, format: uuid }
-        code: { type: string }
+        code: { type: string, description: 6-character code guests type to join }
         name: { type: string }
-        settingsRevision: { type: integer }
+        settingsRevision: { type: integer, description: Increases by one on every settings change. Send it back as `expectedRevision` }
     Track:
       type: object
       properties:
-        trackRef: { type: string }
+        trackRef: { type: string, description: "Stable id in the form `<provider>:<id>`" }
         title: { type: string }
         artist: { type: string }
-        durationMs: { type: integer }
+        durationMs: { type: integer, description: Length in milliseconds }
     QueueItem:
       type: object
       properties:
-        id: { type: string, format: uuid }
+        id: { type: string, format: uuid, description: Id of this entry in the queue (not the track) }
         track: { $ref: '#/components/schemas/Track' }
-        status: { type: string }
+        status: { type: string, enum: [Pending, AwaitingApproval, Next, Playing, Played, Skipped, Removed, Rejected], description: "Waiting items are Pending, Next (chosen to play next) or AwaitingApproval (off-vibe, needs a host decision); the rest are finished" }
