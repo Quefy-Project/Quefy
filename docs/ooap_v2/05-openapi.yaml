@@ -1,0 +1,499 @@
+openapi: 3.1.0
+info:
+  title: Quefy API (core operations and their errors)
+  version: "1.0.0"
+  description: |
+    A short description of 12 core operations of the Quefy API with the errors each one can return.
+    The running server publishes the full document at `/openapi/v1.json` (UI at `/docs`).
+
+    Every error is a problem document (RFC 9457, `application/problem+json`) with a stable `code`.
+    - 400: the request body or parameters are malformed
+    - 401: missing, expired or invalid token
+    - 403: logged in, but not allowed in this room
+    - 404: the thing does not exist
+    - 409: conflicts with the current state
+    - 422: well-formed, but breaks a business rule
+    - 429: too many requests (always with `Retry-After`)
+    - 502 / 503: an upstream service or the speaker is unavailable
+servers:
+  - url: http://localhost:5080
+security:
+  - bearer: []
+
+paths:
+  /api/v1/auth/device:
+    post:
+      tags: [Identity]
+      summary: Register a device and get tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceRequest' }
+            example: { displayName: Olya, locale: uk-UA }
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '422':
+          description: Name is empty or has control characters
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/invalid_display_name', title: The name must be 1-32 visible characters., status: 422, code: invalid_display_name, field: displayName, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Identity]
+      summary: Exchange a refresh token for a new pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties: { refreshToken: { type: string } }
+      responses:
+        '200':
+          description: New tokens. The old refresh token no longer works.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: Unknown, expired, revoked or already used refresh token
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                reused: { value: { type: 'https://quefy.app/problems/refresh_token_reused', title: The refresh token was already used; the session has been revoked., status: 401, code: refresh_token_reused, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/rooms:
+    post:
+      tags: [Rooms]
+      summary: Host a party
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 48 }
+                vibePreset: { type: string, examples: [chill] }
+                vibePrompt: { type: string, maxLength: 280 }
+      responses:
+        '201':
+          description: Party created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Room' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422':
+          description: Invalid name, or a vibe description that is not about music
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/vibe_prompt_rejected', title: This vibe description couldn't be understood., status: 422, code: vibe_prompt_rejected, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/rooms/by-code/{code}/join:
+    post:
+      tags: [Rooms]
+      summary: Join a party by its code
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string, examples: [K7P2QX] } }
+      responses:
+        '200':
+          description: Joined
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Room' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The user was banned from this party
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/banned_from_room', title: You were removed from this room., status: 403, code: banned_from_room, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '404':
+          description: No active party with this code
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/room_not_found', title: Room not found., status: 404, code: room_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '409': { $ref: '#/components/responses/RoomEnded' }
+        '422':
+          description: The party is full
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/room_full', title: This party is full., status: 422, code: room_full, limit: 150, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/rooms/{roomId}:
+    patch:
+      tags: [Rooms]
+      summary: Change the party name or rules (host and co-host)
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedRevision]
+              properties:
+                expectedRevision: { type: integer, description: The revision the editor saw }
+                name: { type: string }
+                settings: { type: object, additionalProperties: true }
+            example: { expectedRevision: 3, settings: { skipRatio: 0.6 } }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Room' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/HostOnly' }
+        '404': { $ref: '#/components/responses/RoomNotFound' }
+        '409':
+          description: Somebody else changed the rules first, or the party has ended
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/concurrency_conflict', title: The resource was changed by someone else. Reload and try again., status: 409, code: concurrency_conflict, currentRevision: 4, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '422':
+          description: A setting is out of range
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/invalid_setting', title: A room setting is out of range., status: 422, code: invalid_setting, field: skipRatio, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+
+  /api/v1/catalog/search:
+    get:
+      tags: [Catalog]
+      summary: Search tracks
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 100 } }
+      responses:
+        '200':
+          description: Matching tracks
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Track' } }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502':
+          description: Deezer did not answer
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/upstream_unavailable', title: The music catalog isn't responding., status: 502, code: upstream_unavailable, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+
+  /api/v1/rooms/{roomId}/queue:
+    post:
+      tags: [Queue]
+      summary: Add a track to the queue
+      description: Send an `Idempotency-Key` so a retry after a lost response does not add the track twice.
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, maxLength: 64 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trackRef]
+              properties: { trackRef: { type: string, examples: ['deezer:3135556'] } }
+      responses:
+        '201':
+          description: Added
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueueItem' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotMember' }
+        '404': { $ref: '#/components/responses/RoomNotFound' }
+        '409':
+          description: Already in the queue, played recently, party ended, or the idempotency key was reused
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                track_already_queued: { value: { type: 'https://quefy.app/problems/track_already_queued', title: This track is already in the queue., status: 409, code: track_already_queued, queueItemId: 0192a6f4-3c1e-7b2a-9d41-5e8f2c7a1b30, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                track_recently_played: { value: { type: 'https://quefy.app/problems/track_recently_played', title: This track was played recently., status: 409, code: track_recently_played, availableAt: '2026-10-21T23:41:00Z', traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+        '422':
+          description: A room rule is broken (quota, length, explicit, requests paused)
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              examples:
+                queue_quota_exceeded: { value: { type: 'https://quefy.app/problems/queue_quota_exceeded', title: You already have the maximum number of tracks waiting., status: 422, code: queue_quota_exceeded, limit: 3, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+                track_too_long: { value: { type: 'https://quefy.app/problems/track_too_long', title: This track is longer than the room allows., status: 422, code: track_too_long, maxMinutes: 10, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 } }
+        '429':
+          description: Adding too fast (cooldown) or a rate limit
+          headers:
+            Retry-After: { schema: { type: integer } }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/add_cooldown', title: You're adding tracks too quickly., status: 429, code: add_cooldown, retryAfterSeconds: 14, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+
+  /api/v1/rooms/{roomId}/queue/{itemId}:
+    delete:
+      tags: [Queue]
+      summary: Remove a waiting track (own track, or any track for host and co-host)
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+        - { $ref: '#/components/parameters/ItemId' }
+      responses:
+        '204': { description: Removed }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: A guest tried to remove somebody else's track
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/not_your_track', title: You can only remove tracks you added., status: 403, code: not_your_track, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '404':
+          description: No such item in this party
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/queue_item_not_found', title: Queue item not found., status: 404, code: queue_item_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '409':
+          description: The item is already playing or was changed at the same time
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/invalid_state_transition', title: The item can't change to that state anymore., status: 409, code: invalid_state_transition, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+
+  /api/v1/rooms/{roomId}/queue/{itemId}/vote:
+    put:
+      tags: [Queue]
+      summary: Vote on a waiting track (+1, -1 or 0 to clear)
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+        - { $ref: '#/components/parameters/ItemId' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [value]
+              properties: { value: { type: integer, enum: [-1, 0, 1] } }
+      responses:
+        '200': { description: Vote saved }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotMember' }
+        '404': { $ref: '#/components/responses/RoomNotFound' }
+        '422':
+          description: Own track, or the track is no longer waiting
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/cannot_vote_own_track', title: You can't vote for your own track., status: 422, code: cannot_vote_own_track, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+
+  /api/v1/rooms/{roomId}/playback/skip-vote:
+    post:
+      tags: [Playback]
+      summary: Vote to skip the current track
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+      responses:
+        '200':
+          description: Current skip status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  votes: { type: integer }
+                  threshold: { type: integer }
+                  activeListeners: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotMember' }
+        '404':
+          description: No such party, or nothing is playing
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/nothing_playing', title: Nothing is playing right now., status: 404, code: nothing_playing, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '409': { $ref: '#/components/responses/RoomEnded' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/rooms/{roomId}/playback/{command}:
+    post:
+      tags: [Playback]
+      summary: Host transport command (play, pause, skip)
+      parameters:
+        - { $ref: '#/components/parameters/RoomId' }
+        - { name: command, in: path, required: true, schema: { type: string, enum: [play, pause, skip] } }
+      responses:
+        '202': { description: Command accepted }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/HostOnly' }
+        '404': { $ref: '#/components/responses/RoomNotFound' }
+        '503':
+          description: No speaker is connected
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/speaker_offline', title: The speaker is offline., status: 503, code: speaker_offline, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+
+  /api/v1/speakers/pair:
+    post:
+      tags: [Speakers]
+      summary: Pair a speaker (bridge) with a pairing code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties: { code: { type: string, examples: [K7P2QX] }, name: { type: string, examples: [Living-room PC] } }
+      responses:
+        '200':
+          description: Speaker token for the speaker hub
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { speakerId: { type: string, format: uuid }, roomId: { type: string, format: uuid }, accessToken: { type: string, description: Speaker JWT valid 24 hours }, hubPath: { type: string, examples: [/hubs/speaker] } }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '404':
+          description: Unknown, expired or already used code
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example: { type: 'https://quefy.app/problems/pairing_code_invalid', title: The pairing code is invalid or expired., status: 404, code: pairing_code_invalid, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  parameters:
+    RoomId: { name: roomId, in: path, required: true, schema: { type: string, format: uuid } }
+    ItemId: { name: itemId, in: path, required: true, schema: { type: string, format: uuid } }
+
+  responses:
+    ValidationFailed:
+      description: Invalid fields
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: 'https://quefy.app/problems/validation_failed', title: One or more fields are invalid., status: 400, code: validation_failed, errors: { trackRef: ['Must look like deezer:123'] }, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+    Unauthorized:
+      description: Missing or expired access token
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: 'https://quefy.app/problems/unauthorized', title: Authentication is required., status: 401, code: unauthorized, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+    NotMember:
+      description: The user is not a member of this party (or was banned)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: 'https://quefy.app/problems/not_room_member', title: You are not a member of this room., status: 403, code: not_room_member, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+    HostOnly:
+      description: Only the host or a co-host can do this
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: 'https://quefy.app/problems/host_only', title: Only the host or a co-host can do this., status: 403, code: host_only, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+    RoomNotFound:
+      description: No such party
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: 'https://quefy.app/problems/room_not_found', title: Room not found., status: 404, code: room_not_found, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+    RoomEnded:
+      description: The party has ended
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: 'https://quefy.app/problems/room_not_active', title: This party has ended., status: 409, code: room_not_active, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example: { type: 'https://quefy.app/problems/rate_limited', title: Too many requests. Slow down a little., status: 429, code: rate_limited, policy: join, retryAfterSeconds: 10, traceId: 4bf92f3577b34da6a3ce929d0e0e4736 }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code, traceId]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code: { type: string, description: Stable machine code; clients translate by it }
+        traceId: { type: string }
+        errors: { type: object, additionalProperties: { type: array, items: { type: string } } }
+        queueItemId: { type: string, format: uuid }
+        availableAt: { type: string, format: date-time }
+        limit: { type: integer }
+        maxMinutes: { type: integer }
+        retryAfterSeconds: { type: integer }
+        policy: { type: string }
+        currentRevision: { type: integer }
+        field: { type: string }
+    DeviceRequest:
+      type: object
+      required: [displayName]
+      properties:
+        displayName: { type: string, minLength: 1, maxLength: 32 }
+        locale: { type: string }
+    AuthResponse:
+      type: object
+      properties:
+        accessToken: { type: string }
+        accessTokenExpiresAt: { type: string, format: date-time }
+        refreshToken: { type: string }
+        refreshTokenExpiresAt: { type: string, format: date-time }
+    Room:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        settingsRevision: { type: integer }
+    Track:
+      type: object
+      properties:
+        trackRef: { type: string }
+        title: { type: string }
+        artist: { type: string }
+        durationMs: { type: integer }
+    QueueItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        track: { $ref: '#/components/schemas/Track' }
+        status: { type: string }
